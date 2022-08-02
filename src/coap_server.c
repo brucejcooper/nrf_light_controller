@@ -30,6 +30,9 @@ static struct k_work send_dali_cmd;
 
 static struct k_timer led_timer;
 static struct k_timer provisioning_timer;
+static volatile int buttonPressCount = 0;
+
+
 
 static void on_light_request(uint8_t command)
 {
@@ -68,14 +71,13 @@ static void activate_provisioning(struct k_work *item)
 	LOG_INF("Provisioning activated");
 }
 
-static volatile int count = 0;
 
 static void do_send_dali_command(struct k_work *item) {
 	// Send out some stuff.
-	count++;
-	LOG_DBG("Button presses: %d\n", count);
-	dk_set_led(OT_CONNECTION_LED, count % 2);
-	dali_send(count, 16);
+	buttonPressCount++;
+	LOG_DBG("Button presses: %d", buttonPressCount);
+	dk_set_led(OT_CONNECTION_LED, buttonPressCount % 2);
+	dali_send(buttonPressCount, 16);
 }
 
 static void deactivate_provisionig(void)
@@ -172,7 +174,8 @@ void main(void)
 		goto end;
 	}
 
-	dali_init();
+	dali_read_init();
+	dali_write_init();
 
 
 	ret = dk_leds_init();

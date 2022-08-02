@@ -13,6 +13,7 @@
 #include <nrfx_timer.h>
 #include <nrfx_pwm.h>
 #include "srp_utils.h"
+#include "dali.h"
 
 LOG_MODULE_REGISTER(dali, CONFIG_DALI_LOG_LEVEL);
 
@@ -25,38 +26,9 @@ LOG_MODULE_REGISTER(dali, CONFIG_DALI_LOG_LEVEL);
     } while (0)
 
 
-#define INPUT_PIN 4
-#define OUTPUT_PIN 3
-#define BIT_WIDTH_US 833
-#define HALF_BIT_WIDTH_US (BIT_WIDTH_US/2) 
-#define PWM_INVERT 0x8000
-#define MAX_DALI_BITS 32
 #define PULSEWIDTH_TOLERANCE 20
+#define DISABLE_TIMEOUT UINT32_MAX-1
 
-
-static uint16_t outputSequenceValues[MAX_DALI_BITS+3];
-static nrf_pwm_sequence_t outputSequence = {
-	.values = { .p_common =  outputSequenceValues },
-	.length = 1,
-	.repeats = 0,
-	.end_delay = 0
-};
-
-static nrfx_pwm_t pwm = NRFX_PWM_INSTANCE(1);
-static nrfx_pwm_config_t pwmConfig = {
-	.output_pins = { OUTPUT_PIN, NRFX_PWM_PIN_NOT_USED, NRFX_PWM_PIN_NOT_USED, NRFX_PWM_PIN_NOT_USED },
-	.irq_priority = NRFX_PWM_DEFAULT_CONFIG_IRQ_PRIORITY,
-	.base_clock = NRF_PWM_CLK_1MHz,
-	.count_mode = NRF_PWM_MODE_UP,
-	.top_value = 833,
-	.step_mode = NRF_PWM_STEP_AUTO,
-	.load_mode = NRF_PWM_LOAD_COMMON,
-	.skip_gpio_cfg = false,
-	.skip_psel_cfg = false
-};
-
-static nrfx_timer_t timer = NRFX_TIMER_INSTANCE(2);
-static nrfx_timer_config_t timer_cfg = NRFX_TIMER_DEFAULT_CONFIG;
 
 
 typedef enum pulsewidth_type {
@@ -66,9 +38,8 @@ typedef enum pulsewidth_type {
 	PW_TIMEOUT,
 } pulsewidth_type_t;
 
-
-struct input_state_t;
 typedef struct input_state_t *(state_callback_t)(enum pulsewidth_type pulse_width);
+
 
 struct input_state_t {
 	char *name;
@@ -76,10 +47,6 @@ struct input_state_t {
 	uint32_t timeout;
 };
 
-
-static volatile uint32_t lastInputToggle;
-// We start in the ERROR state, until we see an idle line for at least x Usec. 
-static volatile struct input_state_t *currentInputState = NULL;
 
 
 nrfx_gpiote_in_config_t inputGpioteConfig = {
@@ -91,13 +58,17 @@ nrfx_gpiote_in_config_t inputGpioteConfig = {
 };
 
 
-
+static nrfx_timer_t timer = NRFX_TIMER_INSTANCE(2);
+static nrfx_timer_config_t timer_cfg = NRFX_TIMER_DEFAULT_CONFIG;
+struct input_state_t;
+static volatile uint32_t lastInputToggle;
+// We start in the ERROR state, until we see an idle line for at least x Usec. 
+static volatile struct input_state_t *currentInputState = NULL;
 static uint32_t inputShiftReg = 0;
 static size_t inputBitCount = 0;
 static uint32_t lastInputBit;
+static nrf_ppi_channel_t inputTogglePPIchannel;
 
-
-#define DISABLE_TIMEOUT UINT32_MAX-1
 
 
 static struct input_state_t *idle_handleTransition(pulsewidth_type_t pulse_width);
@@ -145,7 +116,7 @@ static struct input_state_t atStartOfBitState = {
 
 
 
-void processInput() {
+static void processInput() {
 	uint32_t value = inputShiftReg;
 	uint32_t numBits = inputBitCount;
 
@@ -161,7 +132,7 @@ static inline void pushBit(uint32_t value) {
 }
 
 static struct input_state_t *getResetState() {
-	uint32_t currentVal = nrf_gpio_pin_read(INPUT_PIN);
+	uint32_t currentVal = nrf_gpio_pin_read(DALI_INPUT_PIN);
 
 	// Which reset state we go into depends on which level we are currently at
 	return currentVal ? &resettingCurrentlyHighState : &resettingCurrentlyLowState ;
@@ -205,7 +176,7 @@ static struct input_state_t *inResettingCurrentlyHigh_handleTransition(pulsewidt
 		// Double check it isn't us by releasing the output
 		LOG_DBG("Resetting output");
 
-		nrf_gpio_pin_clear(OUTPUT_PIN);
+		nrf_gpio_pin_clear(DALI_OUTPUT_PIN);
 		// But we stay in the current state.
 		return getResetState();
 	}
@@ -295,15 +266,20 @@ void processStateMachine(pulsewidth_type_t pulse_width, uint32_t ticks) {
 		nrf_timer_cc_set(timer.p_reg, NRF_TIMER_CC_CHANNEL1, newState->timeout);
 		if (currentInputState->timeout == DISABLE_TIMEOUT && newState->timeout != DISABLE_TIMEOUT) {
 			// We've gone from disabled to enabled.
-			LOG_DBG("Starting timer");
-			// nrfx_timer_clear(&timer);
-			// nrfx_timer_enable(&timer);			
+
+			// Switch our PPI task to do a capture upon next toggle. 
+	        nrf_ppi_fork_endpoint_setup(NRF_PPI, inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0));
+			// LOG_DBG("Started timer");
 		} else if (currentInputState->timeout != DISABLE_TIMEOUT && newState->timeout == DISABLE_TIMEOUT) {
-			// gone enabled to disabled.
-			// nrfx_timer_disable(&timer);
+			nrfx_timer_pause(&timer);
+			nrfx_timer_clear(&timer);
+
+			// Switch our PPI task to start the timer upon next toggle
+	        nrf_ppi_fork_endpoint_setup(NRF_PPI, inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_START));
+			// LOG_DBG("Stopped timer");
 		}		
 	}
-	LOG_DBG("Transition pulse %u=%d led to %s->%s", ticks, pulse_width, currentInputState->name, newState->name);
+	// LOG_DBG("Transition pulse %u=%d led to %s->%s", ticks, pulse_width, currentInputState->name, newState->name);
 	currentInputState = (struct input_state_t *) newState;
 }
 
@@ -315,7 +291,7 @@ void processStateMachine(pulsewidth_type_t pulse_width, uint32_t ticks) {
  */
 void inputChanged(nrfx_gpiote_pin_t pin, nrf_gpiote_polarity_t _action) {
 	// Each time our input level changes, we use our state machine to work out what happens next.
-	if (pin == INPUT_PIN) {
+	if (pin == DALI_INPUT_PIN) {
 		uint32_t cc = nrfx_timer_capture_get(&timer, NRF_TIMER_CC_CHANNEL0);
 		uint32_t pulseWidth = cc;
 		pulsewidth_type_t pwt = getPulseWidthType(pulseWidth);
@@ -328,22 +304,14 @@ void inputChanged(nrfx_gpiote_pin_t pin, nrf_gpiote_polarity_t _action) {
  */
 static void timer_callback(nrf_timer_event_t event_type, void* p_context) {
 	if (event_type == NRF_TIMER_EVENT_COMPARE1) {
-		LOG_DBG("Timeout");
 		// Called when a timeout occurs. 
 		processStateMachine(PW_TIMEOUT, 0);
-		// TODO do we need to clear any pending input changes?
 	}
 }
 
 
-static void pwm_handler(nrfx_pwm_evt_type_t event_type, void *p_context) {
-	if (event_type == NRFX_PWM_EVT_FINISHED) {
-		LOG_DBG("PWM send finished\n");
-	}
-}
 
-
-nrfx_err_t dali_init() {
+nrfx_err_t dali_read_init() {
 	// Turn on GPIOTE
 	LOG_DBG("Enabling DALI module");
 
@@ -358,55 +326,26 @@ nrfx_err_t dali_init() {
 
 
 	// Configure Input for GPIOTE, on either edge
-	nrfx_gpiote_in_init(INPUT_PIN, &inputGpioteConfig, inputChanged);
-	nrfx_gpiote_in_event_enable(INPUT_PIN, true);
+	nrfx_gpiote_in_init(DALI_INPUT_PIN, &inputGpioteConfig, inputChanged);
+	nrfx_gpiote_in_event_enable(DALI_INPUT_PIN, true);
 
 	// Set up PPI to capture the current time whenever the input toggles, then clear the timer (ready for the next transition)
-	nrf_ppi_channel_t captureTransitionTimeChannel;
-	NRFX_ERROR_CHECK(nrfx_ppi_channel_alloc(&captureTransitionTimeChannel));
+	NRFX_ERROR_CHECK(nrfx_ppi_channel_alloc(&inputTogglePPIchannel));
 	NRFX_ERROR_CHECK(nrfx_ppi_channel_assign(
-						captureTransitionTimeChannel, 
-						nrfx_gpiote_in_event_addr_get(INPUT_PIN),
-						nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0)
+						inputTogglePPIchannel, 
+						nrfx_gpiote_in_event_addr_get(DALI_INPUT_PIN),
+						nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CLEAR)						
 					));
-	nrfx_ppi_channel_fork_assign(captureTransitionTimeChannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CLEAR));
-    NRFX_ERROR_CHECK(nrfx_ppi_channel_enable(captureTransitionTimeChannel));
+	nrfx_ppi_channel_fork_assign(inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0));
+    NRFX_ERROR_CHECK(nrfx_ppi_channel_enable(inputTogglePPIchannel));
 
 	// Also set a timer that goes off if we've stayed in any one value for too long (resetting us back to a different state.)
 	nrfx_timer_extended_compare(&timer, NRF_TIMER_CC_CHANNEL1, 3*BIT_WIDTH_US, NRF_TIMER_SHORT_COMPARE1_CLEAR_MASK, true);
 	nrfx_timer_clear(&timer);	
-
-	// NRFX is not setting up the IRQ properly, so we use our own
-	IRQ_DIRECT_CONNECT(PWM1_IRQn, 0, nrfx_pwm_1_irq_handler, 0);
-	NRFX_ERROR_CHECK(nrfx_pwm_init(&pwm, &pwmConfig, pwm_handler, NULL));
-
 
 	// Our initial state depends on what value the bus is currently at.  It will be one of the reset states, which means we will wait
 	// until the bus is idle before startng to read.
 	currentInputState = getResetState();
 	nrfx_timer_enable(&timer);
 	return 0;
-}
-
-
-
-void dali_send(uint32_t output, size_t numBits) {
-	int bitPos = 0;
-
-	__ASSERT(numBits <= MAX_DALI_BITS, "Attempt to send more than 32 bits via dali");
-
-	// First bit is a start bit (a logical 1)
-	outputSequenceValues[bitPos++] = PWM_INVERT | HALF_BIT_WIDTH_US;
-
-	// Loop through each of the bits, starting with the MSB
-	for (uint32_t bitMask = 1 << (numBits-1); bitMask != 0; bitMask >>=1) {
-		// We always have the same duty, but we flip the polarity depending on if the bit is set or not.
-		outputSequenceValues[bitPos++] = ((output & bitMask) ? 0x8000 : 0) | HALF_BIT_WIDTH_US;
-	}
-	// Add the stop bits (2 bit periods where it is just high)
-	outputSequenceValues[bitPos++] = PWM_INVERT;
-	outputSequenceValues[bitPos++] = PWM_INVERT;
-	outputSequence.length = bitPos;
-
-	nrfx_pwm_simple_playback(&pwm, &outputSequence, 1, 0);
 }
