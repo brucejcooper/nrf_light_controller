@@ -42,7 +42,6 @@ typedef struct input_state_t *(state_callback_t)(enum pulsewidth_type pulse_widt
 
 
 struct input_state_t {
-	char *name;
 	state_callback_t *handler;
 	uint32_t timeout;
 };
@@ -79,37 +78,31 @@ static struct input_state_t *inHalfBit_handleTransition(pulsewidth_type_t pulse_
 static struct input_state_t *atStartOfBit_handleTransition(pulsewidth_type_t pulse_width);
 
 static struct input_state_t idleState = {
-	.name = "idle",
 	.handler = idle_handleTransition,
 	.timeout = DISABLE_TIMEOUT, // We never timeout.
 };
 
 static struct input_state_t inStartBitState = {
-	.name = "start",
 	.handler = inStartBit_handleTransition,
 	.timeout = HALF_BIT_WIDTH_US*3/2,
 };
 
 static struct input_state_t resettingCurrentlyLowState = {
-	.name = "r_low",
 	.handler = inResettingCurrentlyLow_handleTransition,
 	.timeout = BIT_WIDTH_US*2, // After this time, we transition back out
 };
 
 static struct input_state_t resettingCurrentlyHighState = {
-	.name = "r_high",
 	.handler = inResettingCurrentlyHigh_handleTransition,
 	.timeout = BIT_WIDTH_US*2, // If its held high for this long, then that is bad.
 };
 
 static struct input_state_t inHalfBitState = {
-	.name = "h",
 	.handler = inHalfBit_handleTransition,
 	.timeout = BIT_WIDTH_US*3/2,
 };
 
 static struct input_state_t atStartOfBitState = {
-	.name = "s",
 	.handler = atStartOfBit_handleTransition,
 	.timeout = BIT_WIDTH_US*2,
 };
@@ -136,6 +129,11 @@ static struct input_state_t *getResetState() {
 
 	// Which reset state we go into depends on which level we are currently at
 	return currentVal ? &resettingCurrentlyHighState : &resettingCurrentlyLowState ;
+}
+
+static struct input_state_t *cancelTransmitThenGetResetState() {
+	dali_abort_write();
+	return getResetState();
 }
 
 
@@ -174,9 +172,9 @@ static struct input_state_t *inResettingCurrentlyHigh_handleTransition(pulsewidt
 	// Somebody has done something illegal. 
 	if (pulse_width == PW_TIMEOUT) {
 		// Double check it isn't us by releasing the output
-		LOG_DBG("Resetting output");
 
 		nrf_gpio_pin_clear(DALI_OUTPUT_PIN);
+		LOG_ERR("Resetting output, as its stuck in a shorted state.");
 		// But we stay in the current state.
 		return getResetState();
 	}
@@ -206,13 +204,13 @@ static struct input_state_t *inHalfBit_handleTransition(pulsewidth_type_t pulse_
 				return &idleState;
 			} else {
 				// We've been stuck low for too long.  This is bad.
-				return getResetState();
+				return cancelTransmitThenGetResetState();
 			}
 			break;
 
 		default:
 			// All others are invlaid, so we reset. 
-			return getResetState();
+			return cancelTransmitThenGetResetState();
 	}
 }
 
@@ -232,11 +230,11 @@ static struct input_state_t *atStartOfBit_handleTransition(pulsewidth_type_t pul
 				processInput();
 				return &idleState;
 			} 
-			return getResetState();
+			return cancelTransmitThenGetResetState();
 
 		default:
 			// all other transitions are invalid.
-			return getResetState();
+			return cancelTransmitThenGetResetState();
 	}	
 }
 
@@ -265,21 +263,16 @@ void processStateMachine(pulsewidth_type_t pulse_width, uint32_t ticks) {
 	if (newState != currentInputState) {
 		nrf_timer_cc_set(timer.p_reg, NRF_TIMER_CC_CHANNEL1, newState->timeout);
 		if (currentInputState->timeout == DISABLE_TIMEOUT && newState->timeout != DISABLE_TIMEOUT) {
-			// We've gone from disabled to enabled.
-
-			// Switch our PPI task to do a capture upon next toggle. 
+			// Switch our PPI second task to do a capture upon next toggle. 
 	        nrf_ppi_fork_endpoint_setup(NRF_PPI, inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0));
-			// LOG_DBG("Started timer");
 		} else if (currentInputState->timeout != DISABLE_TIMEOUT && newState->timeout == DISABLE_TIMEOUT) {
 			nrfx_timer_pause(&timer);
 			nrfx_timer_clear(&timer);
 
-			// Switch our PPI task to start the timer upon next toggle
+			// Switch our PPI second task to start the timer upon next toggle
 	        nrf_ppi_fork_endpoint_setup(NRF_PPI, inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_START));
-			// LOG_DBG("Stopped timer");
 		}		
 	}
-	// LOG_DBG("Transition pulse %u=%d led to %s->%s", ticks, pulse_width, currentInputState->name, newState->name);
 	currentInputState = (struct input_state_t *) newState;
 }
 
@@ -324,7 +317,6 @@ nrfx_err_t dali_read_init() {
 	IRQ_DIRECT_CONNECT(TIMER2_IRQn, 0, nrfx_timer_2_irq_handler, 0);
     NRFX_ERROR_CHECK(nrfx_timer_init(&timer, &timer_cfg, timer_callback));
 
-
 	// Configure Input for GPIOTE, on either edge
 	nrfx_gpiote_in_init(DALI_INPUT_PIN, &inputGpioteConfig, inputChanged);
 	nrfx_gpiote_in_event_enable(DALI_INPUT_PIN, true);
@@ -332,16 +324,16 @@ nrfx_err_t dali_read_init() {
 	// Set up PPI to capture the current time whenever the input toggles, then clear the timer (ready for the next transition)
 	NRFX_ERROR_CHECK(nrfx_ppi_channel_alloc(&inputTogglePPIchannel));
 	NRFX_ERROR_CHECK(nrfx_ppi_channel_assign(
-						inputTogglePPIchannel, 
+						inputTogglePPIchannel,
 						nrfx_gpiote_in_event_addr_get(DALI_INPUT_PIN),
-						nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CLEAR)						
+						nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CLEAR)
 					));
-	nrfx_ppi_channel_fork_assign(inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0));
+	NRFX_ERROR_CHECK(nrfx_ppi_channel_fork_assign(inputTogglePPIchannel, nrfx_timer_task_address_get(&timer, NRF_TIMER_TASK_CAPTURE0)));
     NRFX_ERROR_CHECK(nrfx_ppi_channel_enable(inputTogglePPIchannel));
 
 	// Also set a timer that goes off if we've stayed in any one value for too long (resetting us back to a different state.)
 	nrfx_timer_extended_compare(&timer, NRF_TIMER_CC_CHANNEL1, 3*BIT_WIDTH_US, NRF_TIMER_SHORT_COMPARE1_CLEAR_MASK, true);
-	nrfx_timer_clear(&timer);	
+	nrfx_timer_clear(&timer);
 
 	// Our initial state depends on what value the bus is currently at.  It will be one of the reset states, which means we will wait
 	// until the bus is idle before startng to read.

@@ -47,13 +47,13 @@ static nrfx_pwm_config_t pwmConfig = {
 	.top_value = 833,
 	.step_mode = NRF_PWM_STEP_AUTO,
 	.load_mode = NRF_PWM_LOAD_COMMON,
-	.skip_gpio_cfg = false,
+	.skip_gpio_cfg = true,
 	.skip_psel_cfg = false
 };
 
 
 
-static void pwm_handler(nrfx_pwm_evt_type_t event_type, void *p_context) {
+static void pwm_callback(nrfx_pwm_evt_type_t event_type, void *p_context) {
 	if (event_type == NRFX_PWM_EVT_FINISHED) {
 		LOG_DBG("PWM send finished");
 	}
@@ -64,10 +64,21 @@ nrfx_err_t dali_write_init() {
 	// Turn on GPIOTE
 	LOG_DBG("Enabling DALI module");
 
+
+	// We initialise the pin ourselves, as we need to set it to a different drive level
+	nrf_gpio_pin_write(DALI_OUTPUT_PIN, 0);
+    nrf_gpio_cfg(
+        DALI_OUTPUT_PIN,
+        NRF_GPIO_PIN_DIR_OUTPUT,
+        NRF_GPIO_PIN_INPUT_DISCONNECT,
+        NRF_GPIO_PIN_NOPULL,
+        NRF_GPIO_PIN_S0H1,
+        NRF_GPIO_PIN_NOSENSE);
+
+
 	// NRFX is not setting up the IRQ properly, so we use our own
 	IRQ_DIRECT_CONNECT(PWM1_IRQn, 0, nrfx_pwm_1_irq_handler, 0);
-	NRFX_ERROR_CHECK(nrfx_pwm_init(&pwm, &pwmConfig, pwm_handler, NULL));
-
+	NRFX_ERROR_CHECK(nrfx_pwm_init(&pwm, &pwmConfig, pwm_callback, NULL));
 
 	return 0;
 }
